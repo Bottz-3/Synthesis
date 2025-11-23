@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 gpui = "0.2.2"
+unicode-segmentation = "1.12.0"
