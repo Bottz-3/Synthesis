@@ -491,7 +491,7 @@ impl Element for TextElement {
         let input = self.input.read(cx);
         let mut style = Style::default();
 
-        let total_height = window.line_height() * input.line_count;
+        let total_height = (window.line_height() * input.line_count);
         style.size.width = relative(1.).into();
         style.size.height = total_height.into();
         (window.request_layout(style, [], cx), ())
@@ -534,7 +534,6 @@ impl Element for TextElement {
                 &[run],
                 None,
             );
-
             shaped_lines.push(shaped_line);
         }
 
@@ -645,7 +644,6 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
@@ -669,13 +667,10 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .line_height(px(30.))
             .text_size(px(24.))
-            .child(
-                div()
-                    .size_full()
-                    .p(px(4.))
-                    .bg(red())
-                    .child(TextElement { input: cx.entity() }),
-            )
+            .size_full()
+            .bg(white())
+            .p_1()
+            .child(TextElement { input: cx.entity() })
     }
 }
 
@@ -699,9 +694,13 @@ impl Focusable for Input {
 impl Render for Input {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .bg(rgb(0xaaaaaa))
-            .track_focus(&self.focus_handle(cx))
             .size_full()
+            .bg(rgb(0xaaaaaa))
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .track_focus(&self.focus_handle(cx))
             .child(self.text_input.clone())
     }
 }
