@@ -3,10 +3,10 @@ use std::ops::Range;
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, Keystroke,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowOptions, actions, black, div, fill, point, prelude::*, px, red, relative, rgb, rgba,
-    size, white,
+    LayoutId, LineFragment, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    Window, WindowBounds, WindowOptions, actions, black, div, fill, point, prelude::*, px, red,
+    relative, rgb, rgba, size, white,
 };
 use unicode_segmentation::*;
 
@@ -34,11 +34,13 @@ actions!(
 struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
+    visual_line_count: usize,
     line_count: usize, // change for larger int sizes
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     last_layout: Option<Vec<ShapedLine>>,
+    last_line_metadata: Option<Vec<(usize, usize, usize)>>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
 }
@@ -171,15 +173,18 @@ impl TextInput {
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
-        println!("Mouse click at position: {:?}", position);
         if self.content.is_empty() {
             return 0;
         }
 
-        let (Some(bounds), Some(lines)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
-        else {
+        let (Some(bounds), Some(lines), Some(metadata)) = (
+            self.last_bounds.as_ref(),
+            self.last_layout.as_ref(),
+            self.last_line_metadata.as_ref(),
+        ) else {
             return 0;
         };
+
         if position.y < bounds.top() {
             return 0;
         }
@@ -188,27 +193,32 @@ impl TextInput {
         }
 
         let line_height = px(30.);
-        let line_index = ((position.y - bounds.top()) / line_height).floor() as usize;
+        let visual_line_idx = ((position.y - bounds.top()) / line_height).floor() as usize;
 
-        if line_index >= lines.len() {
+        if visual_line_idx >= lines.len() {
             return self.content.len();
         }
 
-        let line = &lines[line_index];
-
+        let line = &lines[visual_line_idx];
         let index_in_line = line.closest_index_for_x(position.x - bounds.left());
 
-        let mut off = 0;
-        for (i, content_line) in self.content.split('\n').enumerate() {
-            if i < line_index {
-                off += content_line.len() + 1; // for \n
+        // Get metadata for the clicked visual line
+        let (logical_idx, line_offset, _line_len) = metadata[visual_line_idx];
+
+        // Calculate byte offset: sum of all complete logical lines before this one,
+        // plus the offset within the current logical line
+        let mut byte_offset = 0;
+
+        // Add lengths of all logical lines before the current one
+        for (i, logical_line) in self.content.split('\n').enumerate() {
+            if i < logical_idx {
+                byte_offset += logical_line.len() + 1; // +1 for '\n'
             } else {
-                off += index_in_line;
                 break;
             }
         }
-        println!("Returning index: {}", off);
-        off
+        // Add the offset within the current logical line, plus the index within the visual segment
+        byte_offset + line_offset + index_in_line
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -459,6 +469,7 @@ struct PrepaintState {
     lines: Option<Vec<ShapedLine>>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    line_metadata: Vec<(usize, usize, usize)>,
 }
 
 impl IntoElement for TextElement {
@@ -491,7 +502,7 @@ impl Element for TextElement {
         let input = self.input.read(cx);
         let mut style = Style::default();
 
-        let total_height = (window.line_height() * input.line_count);
+        let total_height = window.line_height() * input.visual_line_count;
         style.size.width = relative(1.).into();
         style.size.height = total_height.into();
         (window.request_layout(style, [], cx), ())
@@ -516,11 +527,19 @@ impl Element for TextElement {
         let (display_text, text_color) = (content, style.color);
         let font_size = style.font_size.to_pixels(window.rem_size());
 
+        // Calculate wrap width from bounds
+        let wrap_width = bounds.size.width; // Account for padding
+        let mut line_wrapper = window.text_system().line_wrapper(style.font(), font_size);
+
         let mut shaped_lines = Vec::new();
 
-        for line_text in display_text.split('\n') {
+        // Track metadata for each shaped line: (logical_line_idx, byte_offset_in_logical_line, byte_length)
+        let mut line_metadata = Vec::new();
+
+        // Process each logical line (split by '\n')
+        for (logical_line_idx, logical_line) in display_text.split('\n').enumerate() {
             let run = TextRun {
-                len: line_text.len(),
+                len: logical_line.len(),
                 font: style.font(),
                 color: text_color,
                 background_color: None,
@@ -528,75 +547,145 @@ impl Element for TextElement {
                 strikethrough: None,
             };
 
-            let shaped_line = window.text_system().shape_line(
-                line_text.to_string().into(),
-                font_size,
-                &[run],
-                None,
-            );
-            shaped_lines.push(shaped_line);
+            // Get wrap boundaries for this logical line
+            let boundaries: Vec<_> = line_wrapper
+                .wrap_line(&[gpui::LineFragment::text(logical_line)], wrap_width)
+                .collect();
+
+            if boundaries.is_empty() {
+                // No wrapping needed - shape the entire line
+                let shaped = window.text_system().shape_line(
+                    logical_line.to_string().into(),
+                    font_size,
+                    &[run],
+                    None,
+                );
+                line_metadata.push((logical_line_idx, 0, logical_line.len()));
+                shaped_lines.push(shaped);
+            } else {
+                // Line needs wrapping - shape each segment
+                let mut prev_ix = 0;
+                for boundary in &boundaries {
+                    let segment = &logical_line[prev_ix..boundary.ix];
+                    let shaped = window.text_system().shape_line(
+                        segment.to_string().into(),
+                        font_size,
+                        &[TextRun {
+                            len: segment.len(),
+                            ..run.clone()
+                        }],
+                        None,
+                    );
+                    line_metadata.push((logical_line_idx, prev_ix, segment.len()));
+                    shaped_lines.push(shaped);
+                    prev_ix = boundary.ix;
+                }
+                // Shape the final segment
+                let final_segment = &logical_line[prev_ix..];
+                let shaped = window.text_system().shape_line(
+                    final_segment.to_string().into(),
+                    font_size,
+                    &[TextRun {
+                        len: final_segment.len(),
+                        ..run
+                    }],
+                    None,
+                );
+                line_metadata.push((logical_line_idx, prev_ix, final_segment.len()));
+                shaped_lines.push(shaped);
+            }
         }
 
-        let mut off = 0;
-        let mut cursor_x = px(0.);
-        let mut cursor_y = bounds.top();
+        // Calculate cursor position using metadata
+        let mut cursor_quad = None;
 
-        for (line_idx, line_text) in display_text.split('\n').enumerate() {
-            let line_end = off + line_text.len();
-            if cursor >= off && cursor <= line_end {
-                let cursor_in_line = cursor - off;
-                cursor_x = shaped_lines[line_idx].x_for_index(cursor_in_line);
-                cursor_y = bounds.top() + (line_idx as f32 * line_height);
-                println!("cursor_x pos: {}, cursor_y pos: {}", cursor_x, cursor_y);
+        for (visual_line_idx, (logical_idx, line_offset, line_len)) in
+            line_metadata.iter().enumerate()
+        {
+            // Calculate byte offset for this visual line
+            let mut byte_offset = 0;
+
+            // Add lengths of all complete logical lines before this one
+            for (i, logical_line) in display_text.split('\n').enumerate() {
+                if i < *logical_idx {
+                    byte_offset += logical_line.len() + 1; // +1 for '\n'
+                } else {
+                    break;
+                }
+            }
+
+            // Add the offset within the current logical line
+            byte_offset += line_offset;
+
+            let line_start = byte_offset;
+            let line_end = byte_offset + line_len;
+
+            // Check if cursor is in this visual line
+            if cursor >= line_start && cursor <= line_end {
+                let cursor_in_line = cursor - line_start;
+                let line = &shaped_lines[visual_line_idx];
+                let cursor_x = line.x_for_index(cursor_in_line);
+                let cursor_y = bounds.top() + (visual_line_idx as f32 * line_height);
+
+                cursor_quad = Some(fill(
+                    Bounds::from_corners(
+                        point(bounds.left() + cursor_x, cursor_y),
+                        point(bounds.left() + cursor_x + px(2.0), cursor_y + line_height),
+                    ),
+                    rgba(0x000000ff),
+                ));
+
                 break;
             }
-            off = line_end + 1;
         }
 
-        let (selection, cursor_quad) = if selected_range.is_empty() {
-            (
-                None,
-                Some(fill(
-                    Bounds::new(
-                        point(bounds.left() + cursor_x, cursor_y),
-                        size(px(2.), line_height),
-                    ),
-                    gpui::blue(),
-                )),
-            )
+        // Calculate selection (simplified for single-line selection)
+        let selection = if selected_range.is_empty() {
+            None
         } else {
-            let mut sel_offset = 0;
-            let mut selection_quad = None;
+            let mut selection = None;
 
-            for (line_idx, line_text) in display_text.split('\n').enumerate() {
-                let line_end = sel_offset + line_text.len();
+            for (visual_line_idx, (logical_idx, line_offset, line_len)) in
+                line_metadata.iter().enumerate()
+            {
+                // Calculate byte offset for this visual line
+                let mut byte_offset = 0;
+                for (i, logical_line) in display_text.split('\n').enumerate() {
+                    if i < *logical_idx {
+                        byte_offset += logical_line.len() + 1;
+                    } else {
+                        break;
+                    }
+                }
+                byte_offset += line_offset;
 
-                if selected_range.start < line_end && selected_range.end > sel_offset {
-                    let line_sel_start = selected_range.start.max(sel_offset) - sel_offset;
-                    let line_sel_end = selected_range.end.min(line_end) - sel_offset;
+                let line_start = byte_offset;
+                let line_end = byte_offset + line_len;
 
-                    let line_y = bounds.top() + (line_idx as f32 * line_height);
-                    let start_x = shaped_lines[line_idx].x_for_index(line_sel_start);
-                    let end_x = shaped_lines[line_idx].x_for_index(line_sel_end);
+                if selected_range.start >= line_start && selected_range.end <= line_end {
+                    let line = &shaped_lines[visual_line_idx];
+                    let start_x = line.x_for_index(selected_range.start - line_start);
+                    let end_x = line.x_for_index(selected_range.end - line_start);
+                    let line_y = bounds.top() + (visual_line_idx as f32 * line_height);
 
-                    selection_quad = Some(fill(
+                    selection = Some(fill(
                         Bounds::from_corners(
                             point(bounds.left() + start_x, line_y),
                             point(bounds.left() + end_x, line_y + line_height),
                         ),
                         rgba(0x3311ff30),
                     ));
-                    println!("cursor_x pos: {}, cursor_y pos: {}", cursor_x, cursor_y);
-                    break; // Only handles one line of selection
+                    break;
                 }
-                sel_offset = line_end + 1;
             }
-            (selection_quad, None)
+            selection
         };
+
         PrepaintState {
             lines: Some(shaped_lines),
             cursor: cursor_quad,
-            selection,
+            selection: selection,
+            line_metadata,
         }
     }
 
@@ -621,6 +710,7 @@ impl Element for TextElement {
         }
         let lines = prepaint.lines.take().unwrap();
         let mut line_origin = bounds.origin;
+        let line_metadata = prepaint.line_metadata.clone();
 
         for line in &lines {
             line.paint(line_origin, window.line_height(), window, cx)
@@ -633,10 +723,14 @@ impl Element for TextElement {
         {
             window.paint_quad(cursor);
         }
+        // In paint()
+        println!("Storing last_bounds: {:?}", bounds);
 
         self.input.update(cx, |input, _cx| {
+            input.visual_line_count = lines.len();
             input.last_layout = Some(lines);
             input.last_bounds = Some(bounds);
+            input.last_line_metadata = Some(line_metadata);
         });
     }
 }
@@ -734,12 +828,14 @@ fn main() {
                 |_, cx| {
                     let text_input = cx.new(|cx| TextInput {
                         focus_handle: cx.focus_handle(),
+                        visual_line_count: 1,
                         line_count: 1,
                         content: "".into(),
                         selected_range: 0..0,
                         selection_reversed: false,
                         marked_range: None,
                         last_layout: None,
+                        last_line_metadata: None,
                         last_bounds: None,
                         is_selecting: false,
                     });
