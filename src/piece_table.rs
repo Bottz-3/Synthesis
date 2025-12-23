@@ -1,4 +1,4 @@
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Piece {
     Original,
     New,
@@ -33,51 +33,54 @@ impl PieceTable {
         }
     }
     pub fn insert(&mut self, idx: usize, text: &str) {
+        // idx is cursor position
         if text.is_empty() {
-            println!("empty!");
             return;
         }
         let start_pos = self.add_buffer.len();
-        // idx is cursor position
+        let prior_add_buff_len = self.add_buffer.len();
+
         self.add_buffer.push_str(text);
-        // now edit the pieces
-        //
+
+        // If piece is at the end or start
         if idx == self.document_len {
             self.pieces.push(PieceNode {
-                start: idx,
+                start: prior_add_buff_len,
                 len: text.len(),
                 source: Piece::New,
             });
         }
         let mut idx_accum = 0;
         let mut target_index: Option<usize> = None;
-        // Handling the case where a piece is in the middle of an existing piece.
-        for (index, piece) in self.pieces.iter_mut().enumerate() {
-            println!("{} {}", idx_accum, piece.len);
-            if idx_accum < piece.len {
-                println!("running!");
-                // shortens the left side by the size of 'text'
-                // however here it's guaranteed to pretty much be 1
-                // as you call it one char at a time for the core logic
-                //piece.len -= text.len();
-                //
-                target_index = Some(index);
+
+        // Saves last piece len val
+        for (index, piece) in self.pieces.iter().enumerate() {
+            if idx_accum > idx {
+                // Saves index of found piece
+                target_index = Some(index - 1);
                 break;
             }
             idx_accum += piece.len;
         }
-
-        println!("{}", target_index.is_none());
         let index = match target_index {
             Some(val) => val,
-            None => return,
+            None => self.pieces.len() - 1,
         };
+        // Remove piece is len is 0 (redundant piece if len is 0)
         let og_size = self.pieces[index].len;
-        let piece_type = self.pieces[index].source.clone();
-        self.pieces[index].len = idx;
+        let piece_type = self.pieces[index].source;
+        let mut index1 = 1;
+        let mut index2 = 2;
+        if idx == 0 {
+            self.pieces.remove(index);
+            index1 = 0;
+            index2 = 1;
+        } else {
+            self.pieces[index].len = idx - (idx_accum - self.pieces[index].len);
+        }
 
         self.pieces.insert(
-            index + 1,
+            index + index1,
             PieceNode {
                 start: start_pos,
                 len: text.len(),
@@ -87,15 +90,13 @@ impl PieceTable {
         self.document_len += text.len();
         // add the right side of the piece
         self.pieces.insert(
-            index + 2,
+            index + index2,
             PieceNode {
-                start: idx,
-                len: og_size - idx,
+                start: self.pieces[index].start + self.pieces[index].len,
+                len: og_size - self.pieces[index].len,
                 source: piece_type,
             },
         );
-
-        println!("size of pieces: {}", self.pieces.len());
     }
     pub fn print(&self) {
         if self.pieces.len() < 1 {
@@ -107,16 +108,17 @@ impl PieceTable {
                 // Print a slice of the original buffer
                 print!(
                     "{}",
-                    &self.og_buffer[piece.start..(piece.start + (piece.len))]
+                    &self.og_buffer[piece.start..(piece.start + piece.len)]
                 )
             } else if piece.source == Piece::New {
-                // Print a slice of the new  buffer
+                // Print a slice of the new buffer
                 print!(
                     "{}",
-                    &self.add_buffer[piece.start..(piece.start + (piece.len))]
+                    &self.add_buffer[piece.start..(piece.start + piece.len)]
                 )
             }
         }
+        println!();
     }
     pub fn delete(start: usize, end: usize) {
         todo!();
